@@ -1,5 +1,8 @@
 # ComfyUI LG_HotReload 扩展
 
+## 分支了稳如老狗的插件，恢复了热重载功能
+### 下面的文档内容图片都是原插件内容
+
 <!-- 语言切换 -->
 [中文](README.md) | [English](README_en.md)
 
