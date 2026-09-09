@@ -22,6 +22,8 @@ import nodes
 
 from .Nodes.Terminal import *
 RELOADED_CLASS_TYPES: dict = {}
+# 一个重载过的节点类型在接下来这段时间（秒）内持续失效它的缓存。
+RELOAD_WINDOW = 30.0
 CUSTOM_NODE_ROOT: list[str] = folder_paths.folder_names_and_paths["custom_nodes"][0]
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 def load_exclude_modules() -> set[str]:
@@ -224,14 +226,15 @@ def is_hidden_file(file_path: str) -> bool:
                 return True
             file_path = os.path.dirname(file_path)
     return False
-def dfs(item_list: list, searches: set) -> bool:
+def get_module_node_names(module_name: str) -> set[str]:
+    """节点名集合：当前注册在本自定义节点模块下的所有节点 class 名。
 
-    for item in item_list:
-        if isinstance(item, (frozenset, tuple)) and dfs(item, searches):
-            return True
-        elif item in searches:
-            return True
-    return False
+    通过 load_custom_node 打在节点类上的 RELATIVE_PYTHON_MODULE 来识别，
+    因此同时兼容 V1(NODE_CLASS_MAPPINGS) 和新版 V3(comfy_entrypoint/io.ComfyNode)。
+    """
+    prefix = f"custom_nodes.{module_name}"
+    return {name for name, node_cls in nodes.NODE_CLASS_MAPPINGS.items()
+            if getattr(node_cls, 'RELATIVE_PYTHON_MODULE', None) == prefix}
 class DebouncedHotReloader(FileSystemEventHandler):
     
     def __init__(self, delay: float = 1.0):
@@ -402,26 +405,11 @@ class DebouncedHotReloader(FileSystemEventHandler):
                     print(f'\033[91m[LG_HotReload] 重新注册模块失败: {str(e)}\033[0m')
                     traceback.print_exc()
 
-                # 确保节点被正确注册到全局的 NODE_CLASS_MAPPINGS 中
-                module = sys.modules.get(module_name)
-                if module and hasattr(module, 'NODE_CLASS_MAPPINGS'):
-                    # 先清理旧的节点映射
-                    for name in list(nodes.NODE_CLASS_MAPPINGS.keys()):
-                        if name in module.NODE_CLASS_MAPPINGS:
-                            del nodes.NODE_CLASS_MAPPINGS[name]
-
-                    # 重新注册节点
-                    for name, node_cls in module.NODE_CLASS_MAPPINGS.items():
-                        nodes.NODE_CLASS_MAPPINGS[name] = node_cls
-                        node_cls.RELATIVE_PYTHON_MODULE = f"custom_nodes.{module_name}"
-
-                    if hasattr(module, 'NODE_DISPLAY_NAME_MAPPINGS'):
-                        nodes.NODE_DISPLAY_NAME_MAPPINGS.update(module.NODE_DISPLAY_NAME_MAPPINGS)
-
-                # 更新节点类型
-                if module and hasattr(module, 'NODE_CLASS_MAPPINGS'):
-                    for key in module.NODE_CLASS_MAPPINGS.keys():
-                        RELOADED_CLASS_TYPES[key] = 3
+                # load_custom_node 已经把属于本模块的节点重新注册进
+                # NODE_CLASS_MAPPINGS；这里按 RELATIVE_PYTHON_MODULE 统一把
+                # V1 与 V3(io.ComfyNode) 节点标为"重载过"，用于失效其缓存。
+                for name in get_module_node_names(module_name):
+                    RELOADED_CLASS_TYPES[name] = time.time()
                 # 重新注册API路由（到动态路由表）
                 register_module_routes(module_name, sys_module_name)
 
@@ -488,28 +476,21 @@ class DebouncedHotReloader(FileSystemEventHandler):
                 return
         try:
             # 获取重载前的节点信息
-            old_nodes = set()
-            old_module = sys.modules.get(module_name)
-            if old_module and hasattr(old_module, 'NODE_CLASS_MAPPINGS'):
-                old_nodes = set(old_module.NODE_CLASS_MAPPINGS.keys())
+            old_nodes = get_module_node_names(module_name)
 
             # 重载模块
             self.__reload(module_name)
 
             # 添加调试信息
             print(f'\033[94m[LG_HotReload] 检查节点注册状态:\033[0m')
-            module = sys.modules.get(module_name)
-            if module and hasattr(module, 'NODE_CLASS_MAPPINGS'):
-                for node_class in module.NODE_CLASS_MAPPINGS.keys():
-                    if node_class in nodes.NODE_CLASS_MAPPINGS:
-                        print(f'\033[92m[LG_HotReload] 节点 {node_class} 已成功注册\033[0m')
-                    else:
-                        print(f'\033[91m[LG_HotReload] 节点 {node_class} 注册失败\033[0m')
+            for node_class in old_nodes | get_module_node_names(module_name):
+                if node_class in nodes.NODE_CLASS_MAPPINGS:
+                    print(f'\033[92m[LG_HotReload] 节点 {node_class} 已成功注册\033[0m')
+                else:
+                    print(f'\033[91m[LG_HotReload] 节点 {node_class} 注册失败\033[0m')
 
             # 获取重载后的节点信息
-            new_nodes = set()
-            if module and hasattr(module, 'NODE_CLASS_MAPPINGS'):
-                new_nodes = set(module.NODE_CLASS_MAPPINGS.keys())
+            new_nodes = get_module_node_names(module_name)
 
             # 计算节点变化
             added_nodes = new_nodes - old_nodes
@@ -570,28 +551,29 @@ class HotReloaderService:
 def monkeypatch():
     
     original_set_prompt = caching.BasicCache.set_prompt
-    def set_prompt(self, dynprompt, node_ids, is_changed_cache):
+    # set_prompt 现在是 async，且 outputs/objects 缓存是 BasicCache 的多个
+    # 子类(HierarchicalCache/LRUCache/RAMPressureCache)。把补丁挂在基类上，
+    # 子类通过 super().set_prompt 也会走到这里，避免只打到 HierarchicalCache。
+    async def set_prompt(self, dynprompt, node_ids, is_changed_cache):
 
-        if not hasattr(self, 'cache_key_set'):
-            RELOADED_CLASS_TYPES.clear()
-            return original_set_prompt(self, dynprompt, node_ids, is_changed_cache)
-        found_keys = []
-        for key, item_list in self.cache_key_set.keys.items():
-            if dfs(item_list, RELOADED_CLASS_TYPES):
-                found_keys.append(key)
-        if len(found_keys):
-            for value_key in list(RELOADED_CLASS_TYPES.keys()):
-                RELOADED_CLASS_TYPES[value_key] -= 1
-                if RELOADED_CLASS_TYPES[value_key] == 0:
-                    del RELOADED_CLASS_TYPES[value_key]
-        for key in found_keys:
-            cache_key = self.cache_key_set.get_data_key(key)
-            if cache_key and cache_key in self.cache:
-                del self.cache[cache_key]
-                del self.cache_key_set.keys[key]
-                del self.cache_key_set.subcache_keys[key]
-        return original_set_prompt(self, dynprompt, node_ids, is_changed_cache)
-    caching.HierarchicalCache.set_prompt = set_prompt
+        now = time.time()
+        reloaded = False
+        for nid in node_ids:
+            if not dynprompt.has_node(nid):
+                continue
+            if now - RELOADED_CLASS_TYPES.get(dynprompt.get_node(nid).get('class_type', ''), 0.0) < RELOAD_WINDOW:
+                reloaded = True
+                break
+        if reloaded:
+            # 整段清空本缓存对象存储，让重载过的节点重新计算。
+            # 同时清空子类(LRU/RAMPressureCache)的辅助字典，避免悬挂 key。
+            self.cache = {}
+            self.subcaches = {}
+            for attr in ('used_generation', 'children', 'timestamps'):
+                if hasattr(self, attr):
+                    setattr(self, attr, {})
+        return await original_set_prompt(self, dynprompt, node_ids, is_changed_cache)
+    caching.BasicCache.set_prompt = set_prompt
 
 def setup():
     
